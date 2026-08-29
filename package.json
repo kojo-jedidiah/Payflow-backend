@@ -1,16 +1,31 @@
 {
   "name": "payflow-backend",
   "version": "1.0.0",
+  "description": "PayFlow backend with Dwolla integration",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
+  "keywords": [
+    "payflow",
+    "dwolla",
+    "ach",
+    "payments"
+  ],
+  "author": "kojo-jedidiah",
+  "license": "ISC",
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
+    "dwolla-v2": "^3.4.0",
     "express": "^4.21.0",
-    "stripe": "^16.0.0",
     "@supabase/supabase-js": "^2.45.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
