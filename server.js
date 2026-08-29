@@ -1,11 +1,18 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { Client } = require('dwolla-v2');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ========== DWOLLA CLIENT ==========
+const dwolla = new Client({
+  key: process.env.DWOLLA_KEY,
+  secret: process.env.DWOLLA_SECRET,
+  environment: 'sandbox' // change to 'production' later
+});
 
 // ========== SUPABASE ==========
 const supabase = createClient(
@@ -22,117 +29,144 @@ app.use(cors({
   ],
   credentials: true
 }));
-
 app.use(express.json());
 
 // ========== HEALTH CHECK ==========
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'PayFlow Backend is running',
+  res.json({
+    status: 'ok',
+    message: 'PayFlow Backend (Dwolla) is running',
     timestamp: new Date().toISOString()
   });
 });
 
-// ========== CREATE SETUP INTENT (Bank Linking) ==========
-// This is the main endpoint for linking a bank account
-app.post('/api/create-setup-intent', async (req, res) => {
+// ========== CREATE DWOLLA CUSTOMER ==========
+app.post('/api/create-customer', async (req, res) => {
   try {
-    const { userId, email } = req.body;
+    const { firstName, lastName, email } = req.body;
 
-    // Create or retrieve a Stripe Customer
-    let customerId = null;
-
-    if (email) {
-      const existingCustomers = await stripe.customers.list({
-        email: email,
-        limit: 1
-      });
-
-      if (existingCustomers.data.length > 0) {
-        customerId = existingCustomers.data[0].id;
-      } else {
-        const customer = await stripe.customers.create({
-          email: email,
-          metadata: { userId: userId || '' }
-        });
-        customerId = customer.id;
-      }
+    if (!firstName || !lastName || !email) {
+      return res.status(400).json({ error: 'firstName, lastName and email are required' });
     }
 
-    const setupIntent = await stripe.setupIntents.create({
-      customer: customerId || undefined,
-      payment_method_types: ['us_bank_account'],
-      payment_method_options: {
-        us_bank_account: {
-          verification_method: 'automatic', // Instant first, then micro-deposit fallback
-        },
-      },
-      metadata: {
-        userId: userId || '',
-      },
+    const customer = await dwolla.post('customers', {
+      firstName,
+      lastName,
+      email,
+      type: 'unverified' // can be upgraded later
     });
+
+    const customerUrl = customer.headers.get('location');
+    const customerId = customerUrl.split('/').pop();
 
     res.json({
-      clientSecret: setupIntent.client_secret,
-      setupIntentId: setupIntent.id,
-      customerId: customerId
+      success: true,
+      customerId,
+      customerUrl
     });
-
   } catch (error) {
-    console.error('Error creating SetupIntent:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Create customer error:', error);
+    res.status(500).json({
+      error: error.body?.message || error.message || 'Failed to create customer'
+    });
   }
 });
 
-// ========== SAVE LINKED BANK ACCOUNT ==========
-app.post('/api/save-bank-account', async (req, res) => {
+// ========== ADD FUNDING SOURCE (Bank Account) ==========
+app.post('/api/add-funding-source', async (req, res) => {
   try {
-    const { userId, paymentMethodId, customerId } = req.body;
+    const { customerId, routingNumber, accountNumber, bankAccountType, name } = req.body;
 
-    if (!paymentMethodId) {
-      return res.status(400).json({ error: 'paymentMethodId is required' });
+    if (!customerId || !routingNumber || !accountNumber) {
+      return res.status(400).json({ error: 'Missing required bank details' });
     }
 
-    // Retrieve the PaymentMethod from Stripe to get bank details
-    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
+    const fundingSource = await dwolla.post(`customers/${customerId}/funding-sources`, {
+      routingNumber,
+      accountNumber,
+      bankAccountType: bankAccountType || 'checking',
+      name: name || 'Bank Account'
+    });
 
-    const bankDetails = paymentMethod.us_bank_account || {};
+    const fundingSourceUrl = fundingSource.headers.get('location');
+    const fundingSourceId = fundingSourceUrl.split('/').pop();
 
     // Save to Supabase
     const { data, error } = await supabase
       .from('bank_accounts')
-      .insert([
-        {
-          user_id: userId,
-          stripe_payment_method_id: paymentMethodId,
-          stripe_customer_id: customerId,
-          bank_name: bankDetails.bank_name || 'Unknown Bank',
-          last4: bankDetails.last4 || null,
-          account_type: bankDetails.account_type || null,
-          status: 'verified',
-          is_default: true
-        }
-      ])
+      .insert([{
+        user_id: req.body.userId || null,
+        stripe_payment_method_id: fundingSourceId, // reusing column for now
+        bank_name: name || 'Linked Bank',
+        last4: accountNumber.slice(-4),
+        account_type: bankAccountType || 'checking',
+        status: 'pending', // will become verified after micro-deposits
+        is_default: true
+      }])
       .select();
-
-    if (error) {
-      console.error('Supabase error:', error);
-      return res.status(500).json({ error: error.message });
-    }
 
     res.json({
       success: true,
-      bankAccount: data[0]
+      fundingSourceId,
+      fundingSourceUrl,
+      bankAccount: data?.[0] || null
     });
-
   } catch (error) {
-    console.error('Error saving bank account:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Add funding source error:', error);
+    res.status(500).json({
+      error: error.body?.message || error.message || 'Failed to add funding source'
+    });
   }
 });
 
-// ========== GET USER'S LINKED BANKS ==========
+// ========== INITIATE MICRO-DEPOSITS ==========
+app.post('/api/initiate-micro-deposits', async (req, res) => {
+  try {
+    const { fundingSourceId } = req.body;
+
+    await dwolla.post(`funding-sources/${fundingSourceId}/micro-deposits`);
+
+    res.json({
+      success: true,
+      message: 'Micro-deposits initiated. Check the bank account in 1-2 business days.'
+    });
+  } catch (error) {
+    console.error('Micro-deposits error:', error);
+    res.status(500).json({
+      error: error.body?.message || error.message
+    });
+  }
+});
+
+// ========== VERIFY MICRO-DEPOSITS ==========
+app.post('/api/verify-micro-deposits', async (req, res) => {
+  try {
+    const { fundingSourceId, amount1, amount2 } = req.body;
+
+    await dwolla.post(`funding-sources/${fundingSourceId}/micro-deposits`, {
+      amount1: { value: amount1, currency: 'USD' },
+      amount2: { value: amount2, currency: 'USD' }
+    });
+
+    // Update status in Supabase
+    await supabase
+      .from('bank_accounts')
+      .update({ status: 'verified' })
+      .eq('stripe_payment_method_id', fundingSourceId);
+
+    res.json({
+      success: true,
+      message: 'Bank account verified successfully!'
+    });
+  } catch (error) {
+    console.error('Verify micro-deposits error:', error);
+    res.status(500).json({
+      error: error.body?.message || error.message
+    });
+  }
+});
+
+// ========== GET USER BANKS ==========
 app.get('/api/bank-accounts/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -145,31 +179,7 @@ app.get('/api/bank-accounts/:userId', async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ banks: data });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ========== CREATE PAYOUT / WITHDRAWAL (Example) ==========
-app.post('/api/create-payout', async (req, res) => {
-  try {
-    const { amount, currency = 'usd', paymentMethodId, userId } = req.body;
-
-    if (!amount || amount < 1) {
-      return res.status(400).json({ error: 'Invalid amount' });
-    }
-
-    // Note: For real payouts to external bank accounts you usually need
-    // Stripe Connect or Treasury. This is a simplified example.
-    // In production you would create a Transfer or Payout carefully.
-
-    res.json({
-      message: 'Payout endpoint ready – implement with Stripe Connect or Treasury',
-      received: { amount, currency, paymentMethodId, userId }
-    });
-
+    res.json({ banks: data || [] });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
@@ -178,5 +188,5 @@ app.post('/api/create-payout', async (req, res) => {
 
 // ========== START SERVER ==========
 app.listen(PORT, () => {
-  console.log(`PayFlow Backend running on port ${PORT}`);
+  console.log(`PayFlow Backend (Dwolla) running on port ${PORT}`);
 });
