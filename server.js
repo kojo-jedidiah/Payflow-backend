@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const dwolla = new Client({
   key: process.env.DWOLLA_KEY,
   secret: process.env.DWOLLA_SECRET,
-  environment: 'sandbox' // change to 'production' later
+  environment: 'sandbox' // Change to 'production' when ready
 });
 
 // ========== SUPABASE ==========
@@ -53,7 +53,7 @@ app.post('/api/create-customer', async (req, res) => {
       firstName,
       lastName,
       email,
-      type: 'unverified' // can be upgraded later
+      type: 'unverified'
     });
 
     const customerUrl = customer.headers.get('location');
@@ -75,7 +75,7 @@ app.post('/api/create-customer', async (req, res) => {
 // ========== ADD FUNDING SOURCE (Bank Account) ==========
 app.post('/api/add-funding-source', async (req, res) => {
   try {
-    const { customerId, routingNumber, accountNumber, bankAccountType, name } = req.body;
+    const { customerId, routingNumber, accountNumber, bankAccountType, name, userId } = req.body;
 
     if (!customerId || !routingNumber || !accountNumber) {
       return res.status(400).json({ error: 'Missing required bank details' });
@@ -95,15 +95,19 @@ app.post('/api/add-funding-source', async (req, res) => {
     const { data, error } = await supabase
       .from('bank_accounts')
       .insert([{
-        user_id: req.body.userId || null,
-        stripe_payment_method_id: fundingSourceId, // reusing column for now
+        user_id: userId || null,
+        stripe_payment_method_id: fundingSourceId, // storing Dwolla funding source ID
         bank_name: name || 'Linked Bank',
         last4: accountNumber.slice(-4),
         account_type: bankAccountType || 'checking',
-        status: 'pending', // will become verified after micro-deposits
+        status: 'pending',
         is_default: true
       }])
       .select();
+
+    if (error) {
+      console.error('Supabase error:', error);
+    }
 
     res.json({
       success: true,
@@ -124,6 +128,10 @@ app.post('/api/initiate-micro-deposits', async (req, res) => {
   try {
     const { fundingSourceId } = req.body;
 
+    if (!fundingSourceId) {
+      return res.status(400).json({ error: 'fundingSourceId is required' });
+    }
+
     await dwolla.post(`funding-sources/${fundingSourceId}/micro-deposits`);
 
     res.json({
@@ -142,6 +150,10 @@ app.post('/api/initiate-micro-deposits', async (req, res) => {
 app.post('/api/verify-micro-deposits', async (req, res) => {
   try {
     const { fundingSourceId, amount1, amount2 } = req.body;
+
+    if (!fundingSourceId || !amount1 || !amount2) {
+      return res.status(400).json({ error: 'fundingSourceId, amount1 and amount2 are required' });
+    }
 
     await dwolla.post(`funding-sources/${fundingSourceId}/micro-deposits`, {
       amount1: { value: amount1, currency: 'USD' },
@@ -183,6 +195,75 @@ app.get('/api/bank-accounts/:userId', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== CREATE ACH TRANSFER (Send Money) ==========
+app.post('/api/create-transfer', async (req, res) => {
+  try {
+    const { 
+      sourceFundingSourceId,
+      amount, 
+      userId,
+      note 
+    } = req.body;
+
+    if (!sourceFundingSourceId || !amount) {
+      return res.status(400).json({ error: 'sourceFundingSourceId and amount are required' });
+    }
+
+    // In Sandbox we can transfer from the funding source to itself for testing
+    // In production you would transfer to another customer's funding source
+    // or to your platform's funding source.
+
+    const transfer = await dwolla.post('transfers', {
+      _links: {
+        source: {
+          href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}`
+        },
+        destination: {
+          href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}`
+        }
+      },
+      amount: {
+        currency: 'USD',
+        value: Number(amount).toFixed(2)
+      },
+      metadata: {
+        userId: userId || '',
+        note: note || 'PayFlow ACH Transfer'
+      }
+    });
+
+    const transferUrl = transfer.headers.get('location');
+    const transferId = transferUrl.split('/').pop();
+
+    // Save transaction to Supabase
+    try {
+      await supabase.from('transactions').insert([{
+        user_id: userId,
+        type: 'out',
+        amount: Number(amount),
+        status: 'pending',
+        description: note || 'ACH Transfer',
+        stripe_id: transferId
+      }]);
+    } catch (dbError) {
+      console.error('Failed to save transaction:', dbError);
+    }
+
+    res.json({
+      success: true,
+      transferId,
+      transferUrl,
+      message: 'ACH transfer initiated successfully'
+    });
+
+  } catch (error) {
+    console.error('Transfer error:', error);
+    res.status(500).json({
+      error: error.body?.message || error.message || 'Failed to create transfer'
+    });
   }
 });
 
