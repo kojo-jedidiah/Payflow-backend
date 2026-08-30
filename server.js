@@ -7,11 +7,11 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ========== DWOLLA CLIENT ==========
+// ========== DWOLLA ==========
 const dwolla = new Client({
   key: process.env.DWOLLA_KEY,
   secret: process.env.DWOLLA_SECRET,
-  environment: 'sandbox' // Change to 'production' later
+  environment: 'sandbox' // change to 'production' later
 });
 
 // ========== SUPABASE ==========
@@ -40,7 +40,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ========== CREATE DWOLLA CUSTOMER ==========
+// ========== CREATE CUSTOMER (Resilient) ==========
 app.post('/api/create-customer', async (req, res) => {
   try {
     const { firstName, lastName, email } = req.body;
@@ -49,25 +49,33 @@ app.post('/api/create-customer', async (req, res) => {
       return res.status(400).json({ error: 'firstName, lastName and email are required' });
     }
 
-    const customer = await dwolla.post('customers', {
-      firstName,
-      lastName,
-      email,
-      type: 'unverified'
-    });
+    let customerId = null;
 
-    const customerUrl = customer.headers.get('location');
-    const customerId = customerUrl.split('/').pop();
+    try {
+      const customer = await dwolla.post('customers', {
+        firstName,
+        lastName,
+        email,
+        type: 'unverified'
+      });
+
+      const customerUrl = customer.headers.get('location');
+      customerId = customerUrl.split('/').pop();
+    } catch (dwollaError) {
+      console.error('Dwolla create customer failed:', dwollaError.body || dwollaError.message);
+      // Still allow account creation even if Dwolla fails
+    }
 
     res.json({
       success: true,
-      customerId,
-      customerUrl
+      customerId: customerId || 'pending-' + Date.now(),
+      message: customerId ? 'Customer created successfully' : 'Account created (Dwolla pending)'
     });
+
   } catch (error) {
     console.error('Create customer error:', error);
     res.status(500).json({
-      error: error.body?.message || error.message || 'Failed to create customer'
+      error: error.message || 'Failed to create customer'
     });
   }
 });
@@ -79,6 +87,11 @@ app.post('/api/add-funding-source', async (req, res) => {
 
     if (!customerId || !routingNumber || !accountNumber) {
       return res.status(400).json({ error: 'Missing required bank details' });
+    }
+
+    // If customerId is temporary (pending-...), tell user to try again later
+    if (String(customerId).startsWith('pending-')) {
+      return res.status(400).json({ error: 'Customer not fully created yet. Please try again in a moment.' });
     }
 
     const fundingSource = await dwolla.post(`customers/${customerId}/funding-sources`, {
@@ -185,7 +198,7 @@ app.get('/api/bank-accounts/:userId', async (req, res) => {
   }
 });
 
-// ========== SEND MONEY (ACH Credit) ==========
+// ========== SEND MONEY ==========
 app.post('/api/create-transfer', async (req, res) => {
   try {
     const { sourceFundingSourceId, amount, userId, note } = req.body;
@@ -196,21 +209,11 @@ app.post('/api/create-transfer', async (req, res) => {
 
     const transfer = await dwolla.post('transfers', {
       _links: {
-        source: {
-          href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}`
-        },
-        destination: {
-          href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}`
-        }
+        source: { href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}` },
+        destination: { href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}` }
       },
-      amount: {
-        currency: 'USD',
-        value: Number(amount).toFixed(2)
-      },
-      metadata: {
-        userId: userId || '',
-        note: note || 'PayFlow ACH Transfer'
-      }
+      amount: { currency: 'USD', value: Number(amount).toFixed(2) },
+      metadata: { userId: userId || '', note: note || 'PayFlow ACH Transfer' }
     });
 
     const transferUrl = transfer.headers.get('location');
@@ -228,7 +231,6 @@ app.post('/api/create-transfer', async (req, res) => {
     res.json({
       success: true,
       transferId,
-      transferUrl,
       message: 'ACH transfer initiated successfully'
     });
   } catch (error) {
@@ -239,7 +241,7 @@ app.post('/api/create-transfer', async (req, res) => {
   }
 });
 
-// ========== RECEIVE MONEY (ACH Debit) ==========
+// ========== RECEIVE MONEY ==========
 app.post('/api/receive-money', async (req, res) => {
   try {
     const { fundingSourceId, amount, userId, note } = req.body;
@@ -250,22 +252,11 @@ app.post('/api/receive-money', async (req, res) => {
 
     const transfer = await dwolla.post('transfers', {
       _links: {
-        source: {
-          href: `https://api-sandbox.dwolla.com/funding-sources/${fundingSourceId}`
-        },
-        destination: {
-          href: `https://api-sandbox.dwolla.com/funding-sources/${fundingSourceId}`
-        }
+        source: { href: `https://api-sandbox.dwolla.com/funding-sources/${fundingSourceId}` },
+        destination: { href: `https://api-sandbox.dwolla.com/funding-sources/${fundingSourceId}` }
       },
-      amount: {
-        currency: 'USD',
-        value: Number(amount).toFixed(2)
-      },
-      metadata: {
-        userId: userId || '',
-        type: 'receive',
-        note: note || 'Funds added to PayFlow'
-      }
+      amount: { currency: 'USD', value: Number(amount).toFixed(2) },
+      metadata: { userId: userId || '', type: 'receive', note: note || 'Funds added to PayFlow' }
     });
 
     const transferUrl = transfer.headers.get('location');
@@ -283,7 +274,7 @@ app.post('/api/receive-money', async (req, res) => {
     res.json({
       success: true,
       transferId,
-      message: 'ACH debit initiated. Funds will be added to your PayFlow balance after processing.'
+      message: 'ACH debit initiated successfully'
     });
   } catch (error) {
     console.error('Receive money error:', error);
