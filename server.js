@@ -14,6 +14,10 @@ const dwolla = new Client({
   environment: process.env.DWOLLA_ENV || 'sandbox'
 });
 
+const DWOLLA_BASE = process.env.DWOLLA_ENV === 'production'
+  ? 'https://api.dwolla.com'
+  : 'https://api-sandbox.dwolla.com';
+
 // ========== SUPABASE ==========
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -53,6 +57,25 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Helper: get customer's balance funding source ID
+async function getBalanceFundingSource(customerId) {
+  try {
+    const res = await dwolla.get(`customers/${customerId}/funding-sources`);
+    const sources = res.body._embedded?.['funding-sources'] || [];
+    const balance = sources.find(s => s.type === 'balance' || s.name === 'Balance');
+    if (balance) {
+      return balance._links?.self?.href?.split('/').pop() || balance.id;
+    }
+    const nonBank = sources.find(s => s.type !== 'bank');
+    if (nonBank) {
+      return nonBank._links?.self?.href?.split('/').pop() || nonBank.id;
+    }
+  } catch (e) {
+    console.error('getBalanceFundingSource error:', e.body || e.message);
+  }
+  return null;
+}
+
 // ========== CREATE CUSTOMER (resilient) ==========
 app.post('/api/create-customer', async (req, res) => {
   try {
@@ -73,6 +96,17 @@ app.post('/api/create-customer', async (req, res) => {
       customerId = customerUrl.split('/').pop();
     } catch (dwollaErr) {
       console.error('Dwolla create-customer:', dwollaErr.body || dwollaErr.message);
+      if (dwollaErr.body?.code === 'DuplicateResource' || (dwollaErr.body?._embedded?.errors || []).some(e => e.code === 'Duplicate')) {
+        try {
+          const search = await dwolla.get('customers', { email });
+          const existing = search.body._embedded?.customers?.[0];
+          if (existing) {
+            customerId = existing.id || existing._links?.self?.href?.split('/').pop();
+          }
+        } catch (lookupErr) {
+          console.error('Customer lookup failed:', lookupErr.message);
+        }
+      }
     }
 
     res.json({
@@ -108,7 +142,6 @@ app.post('/api/add-funding-source', async (req, res) => {
     const fundingSourceUrl = fundingSource.headers.get('location');
     const fundingSourceId = fundingSourceUrl.split('/').pop();
 
-    // Save in Supabase (non-fatal if it fails)
     let bankAccount = null;
     try {
       const { data, error } = await supabase
@@ -125,11 +158,8 @@ app.post('/api/add-funding-source', async (req, res) => {
         .select()
         .single();
 
-      if (error) {
-        console.error('Supabase insert error:', error);
-      } else {
-        bankAccount = data;
-      }
+      if (error) console.error('Supabase insert error:', error);
+      else bankAccount = data;
     } catch (sbErr) {
       console.error('Supabase exception:', sbErr);
     }
@@ -175,7 +205,6 @@ app.post('/api/verify-micro-deposits', async (req, res) => {
       amount2: { value: String(amount2), currency: 'USD' }
     });
 
-    // Update Supabase (non-fatal if it fails)
     try {
       const { error } = await supabase
         .from('bank_accounts')
@@ -214,19 +243,26 @@ app.get('/api/bank-accounts/:userId', async (req, res) => {
 // ========== SEND MONEY ==========
 app.post('/api/create-transfer', async (req, res) => {
   try {
-    const { sourceFundingSourceId, amount, userId, note } = req.body;
+    const { sourceFundingSourceId, amount, userId, note, customerId } = req.body;
     if (!sourceFundingSourceId || !amount) {
       return res.status(400).json({ error: 'sourceFundingSourceId and amount are required' });
     }
 
-    const base = process.env.DWOLLA_ENV === 'production'
-      ? 'https://api.dwolla.com'
-      : 'https://api-sandbox.dwolla.com';
+    let sourceId = sourceFundingSourceId;
+    let destId = sourceFundingSourceId;
+
+    if (customerId) {
+      const balanceId = await getBalanceFundingSource(customerId);
+      if (balanceId) {
+        sourceId = balanceId;
+        destId = sourceFundingSourceId;
+      }
+    }
 
     const transfer = await dwolla.post('transfers', {
       _links: {
-        source: { href: `${base}/funding-sources/${sourceFundingSourceId}` },
-        destination: { href: `${base}/funding-sources/${sourceFundingSourceId}` }
+        source: { href: `${DWOLLA_BASE}/funding-sources/${sourceId}` },
+        destination: { href: `${DWOLLA_BASE}/funding-sources/${destId}` }
       },
       amount: { currency: 'USD', value: Number(amount).toFixed(2) },
       metadata: { userId: userId || '', note: note || 'PayFlow ACH Transfer' }
@@ -249,27 +285,35 @@ app.post('/api/create-transfer', async (req, res) => {
 
     res.json({ success: true, transferId, message: 'ACH transfer initiated' });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.body?.message || error.message });
+    console.error('Transfer error:', error.body || error);
+    const msg = error.body?.message
+      || (error.body?._embedded?.errors || []).map(e => e.message).join('; ')
+      || error.message
+      || 'Failed to create transfer';
+    res.status(500).json({ error: msg });
   }
 });
 
-// ========== RECEIVE MONEY ==========
+// ========== RECEIVE MONEY (bank → Dwolla balance) ==========
 app.post('/api/receive-money', async (req, res) => {
   try {
-    const { fundingSourceId, amount, userId, note } = req.body;
+    const { fundingSourceId, amount, userId, note, customerId } = req.body;
     if (!fundingSourceId || !amount || amount <= 0) {
       return res.status(400).json({ error: 'fundingSourceId and a valid amount are required' });
     }
 
-    const base = process.env.DWOLLA_ENV === 'production'
-      ? 'https://api.dwolla.com'
-      : 'https://api-sandbox.dwolla.com';
+    let destId = fundingSourceId;
+    if (customerId) {
+      const balanceId = await getBalanceFundingSource(customerId);
+      if (balanceId) {
+        destId = balanceId;
+      }
+    }
 
     const transfer = await dwolla.post('transfers', {
       _links: {
-        source: { href: `${base}/funding-sources/${fundingSourceId}` },
-        destination: { href: `${base}/funding-sources/${fundingSourceId}` }
+        source: { href: `${DWOLLA_BASE}/funding-sources/${fundingSourceId}` },
+        destination: { href: `${DWOLLA_BASE}/funding-sources/${destId}` }
       },
       amount: { currency: 'USD', value: Number(amount).toFixed(2) },
       metadata: { userId: userId || '', type: 'receive', note: note || 'Funds added to PayFlow' }
@@ -292,8 +336,10 @@ app.post('/api/receive-money', async (req, res) => {
 
     res.json({ success: true, transferId, message: 'ACH debit initiated' });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.body?.message || error.message });
+    console.error('Receive money error:', error.body || error);
+    const embedded = (error.body?._embedded?.errors || []).map(e => e.message).join('; ');
+    const msg = embedded || error.body?.message || error.message || 'Failed to initiate receive transfer';
+    res.status(500).json({ error: msg });
   }
 });
 
