@@ -7,20 +7,20 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---------- Dwolla ----------
+// ========== DWOLLA ==========
 const dwolla = new Client({
   key: process.env.DWOLLA_KEY,
   secret: process.env.DWOLLA_SECRET,
   environment: process.env.DWOLLA_ENV || 'sandbox'
 });
 
-// ---------- Supabase ----------
+// ========== SUPABASE ==========
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ---------- CORS (uses your FRONTEND_URL env) ----------
+// ========== CORS ==========
 const allowedOrigins = [
   process.env.FRONTEND_URL,
   'https://payflow-wqno.onrender.com',
@@ -30,7 +30,6 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    // allow requests with no origin (mobile apps, curl, etc.)
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -41,7 +40,7 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ---------- Health ----------
+// ========== HEALTH ==========
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -54,7 +53,7 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ---------- Create Customer (resilient) ----------
+// ========== CREATE CUSTOMER (resilient) ==========
 app.post('/api/create-customer', async (req, res) => {
   try {
     const { firstName, lastName, email } = req.body;
@@ -74,7 +73,6 @@ app.post('/api/create-customer', async (req, res) => {
       customerId = customerUrl.split('/').pop();
     } catch (dwollaErr) {
       console.error('Dwolla create-customer:', dwollaErr.body || dwollaErr.message);
-      // still succeed so the frontend can continue
     }
 
     res.json({
@@ -88,10 +86,11 @@ app.post('/api/create-customer', async (req, res) => {
   }
 });
 
-// ---------- Add Funding Source ----------
+// ========== ADD FUNDING SOURCE ==========
 app.post('/api/add-funding-source', async (req, res) => {
   try {
     const { customerId, routingNumber, accountNumber, bankAccountType, name, userId } = req.body;
+
     if (!customerId || !routingNumber || !accountNumber) {
       return res.status(400).json({ error: 'Missing required bank details' });
     }
@@ -109,37 +108,47 @@ app.post('/api/add-funding-source', async (req, res) => {
     const fundingSourceUrl = fundingSource.headers.get('location');
     const fundingSourceId = fundingSourceUrl.split('/').pop();
 
-    // Store in Supabase
-    const { data, error } = await supabase
-      .from('bank_accounts')
-      .insert([{
-        user_id: userId || null,
-        stripe_payment_method_id: fundingSourceId,   // we reuse the column name
-        bank_name: name || 'Linked Bank',
-        last4: accountNumber.slice(-4),
-        account_type: bankAccountType || 'checking',
-        status: 'pending',
-        is_default: true
-      }])
-      .select();
+    // Save in Supabase (non-fatal if it fails)
+    let bankAccount = null;
+    try {
+      const { data, error } = await supabase
+        .from('bank_accounts')
+        .insert([{
+          user_id: userId || null,
+          stripe_payment_method_id: fundingSourceId,
+          bank_name: name || 'Linked Bank',
+          last4: accountNumber.slice(-4),
+          account_type: bankAccountType || 'checking',
+          status: 'pending',
+          is_default: true
+        }])
+        .select()
+        .single();
 
-    if (error) console.error('Supabase insert bank_accounts:', error);
+      if (error) {
+        console.error('Supabase insert error:', error);
+      } else {
+        bankAccount = data;
+      }
+    } catch (sbErr) {
+      console.error('Supabase exception:', sbErr);
+    }
 
     res.json({
       success: true,
       fundingSourceId,
       fundingSourceUrl,
-      bankAccount: data?.[0] || null
+      bankAccount
     });
   } catch (error) {
-    console.error(error);
+    console.error('Add funding source error:', error);
     res.status(500).json({
       error: error.body?.message || error.message || 'Failed to add funding source'
     });
   }
 });
 
-// ---------- Micro-deposits ----------
+// ========== INITIATE MICRO-DEPOSITS ==========
 app.post('/api/initiate-micro-deposits', async (req, res) => {
   try {
     const { fundingSourceId } = req.body;
@@ -153,6 +162,7 @@ app.post('/api/initiate-micro-deposits', async (req, res) => {
   }
 });
 
+// ========== VERIFY MICRO-DEPOSITS ==========
 app.post('/api/verify-micro-deposits', async (req, res) => {
   try {
     const { fundingSourceId, amount1, amount2 } = req.body;
@@ -165,10 +175,16 @@ app.post('/api/verify-micro-deposits', async (req, res) => {
       amount2: { value: String(amount2), currency: 'USD' }
     });
 
-    await supabase
-      .from('bank_accounts')
-      .update({ status: 'verified' })
-      .eq('stripe_payment_method_id', fundingSourceId);
+    // Update Supabase (non-fatal if it fails)
+    try {
+      const { error } = await supabase
+        .from('bank_accounts')
+        .update({ status: 'verified' })
+        .eq('stripe_payment_method_id', fundingSourceId);
+      if (error) console.error('Supabase verify update error:', error);
+    } catch (sbErr) {
+      console.error('Supabase exception on verify:', sbErr);
+    }
 
     res.json({ success: true, message: 'Bank account verified successfully!' });
   } catch (error) {
@@ -177,7 +193,7 @@ app.post('/api/verify-micro-deposits', async (req, res) => {
   }
 });
 
-// ---------- Get user banks ----------
+// ========== GET USER BANKS ==========
 app.get('/api/bank-accounts/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -195,7 +211,7 @@ app.get('/api/bank-accounts/:userId', async (req, res) => {
   }
 });
 
-// ---------- Transfers (simplified – same source/dest for sandbox demo) ----------
+// ========== SEND MONEY ==========
 app.post('/api/create-transfer', async (req, res) => {
   try {
     const { sourceFundingSourceId, amount, userId, note } = req.body;
@@ -203,10 +219,14 @@ app.post('/api/create-transfer', async (req, res) => {
       return res.status(400).json({ error: 'sourceFundingSourceId and amount are required' });
     }
 
+    const base = process.env.DWOLLA_ENV === 'production'
+      ? 'https://api.dwolla.com'
+      : 'https://api-sandbox.dwolla.com';
+
     const transfer = await dwolla.post('transfers', {
       _links: {
-        source: { href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}` },
-        destination: { href: `https://api-sandbox.dwolla.com/funding-sources/${sourceFundingSourceId}` }
+        source: { href: `${base}/funding-sources/${sourceFundingSourceId}` },
+        destination: { href: `${base}/funding-sources/${sourceFundingSourceId}` }
       },
       amount: { currency: 'USD', value: Number(amount).toFixed(2) },
       metadata: { userId: userId || '', note: note || 'PayFlow ACH Transfer' }
@@ -214,14 +234,18 @@ app.post('/api/create-transfer', async (req, res) => {
 
     const transferId = transfer.headers.get('location').split('/').pop();
 
-    await supabase.from('transactions').insert([{
-      user_id: userId,
-      type: 'out',
-      amount: Number(amount),
-      status: 'pending',
-      description: note || 'ACH Transfer',
-      stripe_id: transferId
-    }]);
+    try {
+      await supabase.from('transactions').insert([{
+        user_id: userId,
+        type: 'out',
+        amount: Number(amount),
+        status: 'pending',
+        description: note || 'ACH Transfer',
+        stripe_id: transferId
+      }]);
+    } catch (sbErr) {
+      console.error('Supabase transaction insert error:', sbErr);
+    }
 
     res.json({ success: true, transferId, message: 'ACH transfer initiated' });
   } catch (error) {
@@ -230,6 +254,7 @@ app.post('/api/create-transfer', async (req, res) => {
   }
 });
 
+// ========== RECEIVE MONEY ==========
 app.post('/api/receive-money', async (req, res) => {
   try {
     const { fundingSourceId, amount, userId, note } = req.body;
@@ -237,10 +262,14 @@ app.post('/api/receive-money', async (req, res) => {
       return res.status(400).json({ error: 'fundingSourceId and a valid amount are required' });
     }
 
+    const base = process.env.DWOLLA_ENV === 'production'
+      ? 'https://api.dwolla.com'
+      : 'https://api-sandbox.dwolla.com';
+
     const transfer = await dwolla.post('transfers', {
       _links: {
-        source: { href: `https://api-sandbox.dwolla.com/funding-sources/${fundingSourceId}` },
-        destination: { href: `https://api-sandbox.dwolla.com/funding-sources/${fundingSourceId}` }
+        source: { href: `${base}/funding-sources/${fundingSourceId}` },
+        destination: { href: `${base}/funding-sources/${fundingSourceId}` }
       },
       amount: { currency: 'USD', value: Number(amount).toFixed(2) },
       metadata: { userId: userId || '', type: 'receive', note: note || 'Funds added to PayFlow' }
@@ -248,14 +277,18 @@ app.post('/api/receive-money', async (req, res) => {
 
     const transferId = transfer.headers.get('location').split('/').pop();
 
-    await supabase.from('transactions').insert([{
-      user_id: userId,
-      type: 'in',
-      amount: Number(amount),
-      status: 'pending',
-      description: note || 'Received via ACH',
-      stripe_id: transferId
-    }]);
+    try {
+      await supabase.from('transactions').insert([{
+        user_id: userId,
+        type: 'in',
+        amount: Number(amount),
+        status: 'pending',
+        description: note || 'Received via ACH',
+        stripe_id: transferId
+      }]);
+    } catch (sbErr) {
+      console.error('Supabase transaction insert error:', sbErr);
+    }
 
     res.json({ success: true, transferId, message: 'ACH debit initiated' });
   } catch (error) {
@@ -264,7 +297,7 @@ app.post('/api/receive-money', async (req, res) => {
   }
 });
 
-// ---------- Start ----------
+// ========== START ==========
 app.listen(PORT, () => {
-  console.log(`PayFlow Backend running on port ${PORT}`);
+  console.log(`PayFlow Backend (Dwolla + Supabase) running on port ${PORT}`);
 });
